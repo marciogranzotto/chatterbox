@@ -40,6 +40,8 @@ def parse_args():
     parser.add_argument("--chunk-silence", type=float, default=0.3, help="Silence between chunks in seconds (default: 0.3)")
     parser.add_argument("--paragraph-silence", type=float, default=1.0, help="Silence between paragraphs in seconds (default: 1.0)")
     parser.add_argument("--chapter-silence", type=float, default=2.0, help="Silence between chapters in seconds (default: 2.0)")
+    parser.add_argument("--dry-run", action="store_true", help="Parse and chunk only, skip TTS generation")
+    parser.add_argument("--max-chunks", type=int, default=None, help="Limit generation to N chunks (for testing)")
     return parser.parse_args()
 
 
@@ -234,7 +236,7 @@ def save_manifest(output_dir: str, manifest: dict):
         json.dump(manifest, f, indent=2, ensure_ascii=False)
 
 
-def generate_chunks(manifest: dict, output_dir: str, ref_path: str, lang: str):
+def generate_chunks(manifest: dict, output_dir: str, ref_path: str, lang: str, max_chunks: int | None = None):
     """Generate TTS audio for all pending chunks."""
     from chatterbox.mtl_tts import ChatterboxMultilingualTTS
 
@@ -251,6 +253,11 @@ def generate_chunks(manifest: dict, output_dir: str, ref_path: str, lang: str):
     log.info("Model loaded.")
 
     pending = [(cid, c) for cid, c in manifest["chunks"].items() if c["status"] == "pending"]
+
+    if max_chunks is not None:
+        pending = pending[:max_chunks]
+        log.info(f"  Limited to {max_chunks} chunks for testing")
+
     total = len(manifest["chunks"])
     done_before = total - len(pending)
 
@@ -388,11 +395,15 @@ def main():
     save_manifest(args.output, manifest)
     log.info(f"Manifest saved with {len(manifest['chunks'])} chunks")
 
-    # Stage 2: Generate TTS audio
-    generate_chunks(manifest, args.output, ref_path, args.lang)
+    if not args.dry_run:
+        # Stage 2: Generate TTS audio
+        generate_chunks(manifest, args.output, ref_path, args.lang, args.max_chunks)
 
-    # Stage 3: Assemble audiobook
-    assemble_audiobook(manifest, args.output, args.chunk_silence, args.paragraph_silence, args.chapter_silence)
+        # Stage 3: Assemble audiobook
+        assemble_audiobook(manifest, args.output, args.chunk_silence, args.paragraph_silence, args.chapter_silence)
+    else:
+        log.info("Dry run — skipping TTS generation and assembly")
+        log.info(f"Would generate {len(manifest['chunks'])} chunks")
 
     log.info("Pipeline complete!")
 
