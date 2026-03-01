@@ -234,6 +234,60 @@ def save_manifest(output_dir: str, manifest: dict):
         json.dump(manifest, f, indent=2, ensure_ascii=False)
 
 
+def generate_chunks(manifest: dict, output_dir: str, ref_path: str, lang: str):
+    """Generate TTS audio for all pending chunks."""
+    from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+
+    # Determine device
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
+
+    log.info(f"Loading ChatterboxMultilingualTTS on {device}...")
+    model = ChatterboxMultilingualTTS.from_pretrained(device=device)
+    log.info("Model loaded.")
+
+    pending = [(cid, c) for cid, c in manifest["chunks"].items() if c["status"] == "pending"]
+    total = len(manifest["chunks"])
+    done_before = total - len(pending)
+
+    log.info(f"Generating {len(pending)} chunks ({done_before} already done)")
+
+    for i, (cid, chunk) in enumerate(pending):
+        progress = done_before + i + 1
+        log.info(f"[{progress}/{total}] Generating {cid}: {chunk['text'][:60]}...")
+
+        try:
+            wav = model.generate(
+                text=chunk["text"],
+                language_id=lang,
+                audio_prompt_path=ref_path,
+                temperature=0.8,
+                top_p=0.95,
+            )
+
+            wav_path = chunk["wav_path"]
+            os.makedirs(os.path.dirname(wav_path), exist_ok=True)
+            ta.save(wav_path, wav, model.sr)
+
+            manifest["chunks"][cid]["status"] = "done"
+            log.info(f"  Saved: {wav_path}")
+
+        except Exception as e:
+            manifest["chunks"][cid]["status"] = "failed"
+            log.error(f"  FAILED: {e}")
+
+        # Save manifest after every chunk for resumability
+        save_manifest(output_dir, manifest)
+
+    done_total = sum(1 for c in manifest["chunks"].values() if c["status"] == "done")
+    failed = sum(1 for c in manifest["chunks"].values() if c["status"] == "failed")
+    log.info(f"Generation complete: {done_total} done, {failed} failed, {total} total")
+
+
 def main():
     args = parse_args()
     log.info("Audiobook translation pipeline starting")
@@ -273,6 +327,9 @@ def main():
 
     save_manifest(args.output, manifest)
     log.info(f"Manifest saved with {len(manifest['chunks'])} chunks")
+
+    # Stage 2: Generate TTS audio
+    generate_chunks(manifest, args.output, ref_path, args.lang)
 
 
 if __name__ == "__main__":
