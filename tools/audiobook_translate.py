@@ -316,34 +316,62 @@ def make_silence(duration_secs: float, sample_rate: int = 24000) -> torch.Tensor
     return torch.zeros(1, num_samples)
 
 
-def trim_audio(wav: torch.Tensor, sample_rate: int = 24000, threshold: float = 0.01, min_silence_ms: int = 200) -> torch.Tensor:
-    """Trim trailing low-energy audio (silence and generation artifacts).
+def trim_audio(wav: torch.Tensor, sample_rate: int = 24000, threshold: float = 0.01,
+               silence_gap_ms: int = 1000) -> torch.Tensor:
+    """Trim audio after the first long silence gap (generation artifacts).
 
-    Scans from the end in 50ms windows. Trims everything after the last
-    window that exceeds the energy threshold, keeping a small tail of
-    min_silence_ms for natural fade-out.
+    The TTS model sometimes generates valid speech, then a silence gap,
+    then garbled re-generation. This detects the first silence gap longer
+    than silence_gap_ms and cuts everything after it.
+
+    Also trims trailing silence from the end.
     """
     window = int(0.05 * sample_rate)  # 50ms
     n_windows = wav.shape[1] // window
+    gap_windows = silence_gap_ms // 50  # how many silent windows = a gap
 
-    # Find last window with energy above threshold (scanning from end)
-    last_active = n_windows  # default: keep everything
+    # Compute energy per window
+    energies = []
     for i in range(n_windows):
-        start = wav.shape[1] - (i + 1) * window
-        end = wav.shape[1] - i * window
+        start = i * window
+        end = (i + 1) * window
         rms = torch.sqrt(torch.mean(wav[0, start:end] ** 2)).item()
-        if rms >= threshold:
-            last_active = n_windows - i
+        energies.append(rms)
+
+    # Find first silence gap longer than gap_windows consecutive silent windows
+    # Only look after the first 500ms of audio (skip leading silence)
+    silent_run = 0
+    cut_point = None
+    for i in range(10, n_windows):  # start at 500ms
+        if energies[i] < threshold:
+            silent_run += 1
+            if silent_run >= gap_windows:
+                # Found a long gap — cut at the start of this silence
+                cut_point = (i - silent_run + 1) * window
+                break
+        else:
+            silent_run = 0
+
+    if cut_point is not None:
+        trimmed = wav[:, :cut_point]
+        trimmed_ms = (wav.shape[1] - trimmed.shape[1]) / sample_rate * 1000
+        log.info(f"    Trimmed {trimmed_ms:.0f}ms of post-speech artifacts")
+        return trimmed
+
+    # No mid-audio gap found — just trim trailing silence
+    last_active = n_windows
+    for i in range(n_windows - 1, -1, -1):
+        if energies[i] >= threshold:
+            last_active = i + 1
             break
 
-    # Keep up to last_active windows + a small silence tail
-    tail_samples = int(min_silence_ms / 1000.0 * sample_rate)
+    tail_samples = int(0.2 * sample_rate)  # keep 200ms tail
     trim_point = min(last_active * window + tail_samples, wav.shape[1])
     trimmed = wav[:, :trim_point]
 
     trimmed_ms = (wav.shape[1] - trimmed.shape[1]) / sample_rate * 1000
     if trimmed_ms > 100:
-        log.debug(f"  Trimmed {trimmed_ms:.0f}ms from end")
+        log.info(f"    Trimmed {trimmed_ms:.0f}ms trailing silence")
 
     return trimmed
 
