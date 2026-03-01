@@ -43,6 +43,12 @@ def parse_args():
     parser.add_argument("--dry-run", action="store_true", help="Parse and chunk only, skip TTS generation")
     parser.add_argument("--max-chunks", type=int, default=None, help="Limit generation to N chunks (for testing)")
     parser.add_argument("--retry-failed", action="store_true", help="Reset failed chunks to pending for retry")
+    parser.add_argument("--skip-chapters", type=str, default=None,
+                        help="Comma-separated chapter numbers (1-indexed) to skip, e.g. '1,2,3,48,49'")
+    parser.add_argument("--start-chapter", type=int, default=None,
+                        help="First chapter number (1-indexed) to include")
+    parser.add_argument("--end-chapter", type=int, default=None,
+                        help="Last chapter number (1-indexed) to include")
     return parser.parse_args()
 
 
@@ -95,7 +101,9 @@ def parse_epub(epub_path: str) -> list[dict]:
     Returns a list of dicts: [{"title": str, "paragraphs": [str, ...]}]
     """
     from ebooklib import epub
-    from bs4 import BeautifulSoup
+    from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
+    import warnings
+    warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
     book = epub.read_epub(epub_path, options={"ignore_ncx": True})
     chapters = []
@@ -401,6 +409,18 @@ def main():
     if not chapters:
         log.error("No chapters found in EPUB")
         sys.exit(1)
+
+    # Filter chapters if requested
+    total_parsed = len(chapters)
+    if args.skip_chapters:
+        skip_set = {int(x.strip()) for x in args.skip_chapters.split(",")}
+        chapters = [ch for i, ch in enumerate(chapters, 1) if i not in skip_set]
+        log.info(f"Skipped chapters {skip_set}: {total_parsed} -> {len(chapters)} chapters")
+    if args.start_chapter is not None or args.end_chapter is not None:
+        start = (args.start_chapter or 1) - 1
+        end = args.end_chapter or total_parsed
+        chapters = chapters[start:end]
+        log.info(f"Chapter range [{start+1}-{end}]: {len(chapters)} chapters selected")
 
     # Stage 1c: Build chunk list and manifest
     all_chunks = build_chunk_list(chapters)
