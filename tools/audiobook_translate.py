@@ -190,6 +190,50 @@ def build_chunk_list(chapters: list[dict]) -> list[dict]:
     return all_chunks
 
 
+def chunk_id(chunk: dict) -> str:
+    """Generate a unique ID for a chunk."""
+    return f"ch{chunk['chapter_idx']:03d}_p{chunk['paragraph_idx']:04d}_c{chunk['chunk_idx']:03d}"
+
+
+def chunk_wav_path(output_dir: str, chunk: dict) -> str:
+    """Return the .wav path for a given chunk."""
+    ch_dir = os.path.join(output_dir, "chapters", f"ch{chunk['chapter_idx']:03d}")
+    os.makedirs(ch_dir, exist_ok=True)
+    return os.path.join(ch_dir, f"{chunk_id(chunk)}.wav")
+
+
+def create_manifest(output_dir: str, chunks: list[dict]) -> dict:
+    """Create a new manifest tracking all chunks."""
+    manifest = {
+        "version": 1,
+        "chunks": {},
+    }
+    for chunk in chunks:
+        cid = chunk_id(chunk)
+        manifest["chunks"][cid] = {
+            **chunk,
+            "status": "pending",
+            "wav_path": chunk_wav_path(output_dir, chunk),
+        }
+    return manifest
+
+
+def load_manifest(output_dir: str) -> dict | None:
+    """Load an existing manifest if it exists."""
+    manifest_path = os.path.join(output_dir, "manifest.json")
+    if os.path.exists(manifest_path):
+        with open(manifest_path) as f:
+            return json.load(f)
+    return None
+
+
+def save_manifest(output_dir: str, manifest: dict):
+    """Save manifest to disk."""
+    manifest_path = os.path.join(output_dir, "manifest.json")
+    with open(manifest_path, "w") as f:
+        json.dump(manifest, f, indent=2, ensure_ascii=False)
+
+
 def main():
     args = parse_args()
     log.info("Audiobook translation pipeline starting")
@@ -212,8 +256,23 @@ def main():
         log.error("No chapters found in EPUB")
         sys.exit(1)
 
-    # Stage 1c: Build chunk list
+    # Stage 1c: Build chunk list and manifest
     all_chunks = build_chunk_list(chapters)
+
+    if args.resume:
+        manifest = load_manifest(args.output)
+        if manifest:
+            done = sum(1 for c in manifest["chunks"].values() if c["status"] == "done")
+            total = len(manifest["chunks"])
+            log.info(f"Resuming: {done}/{total} chunks already done")
+        else:
+            log.warning("--resume given but no manifest found, starting fresh")
+            manifest = create_manifest(args.output, all_chunks)
+    else:
+        manifest = create_manifest(args.output, all_chunks)
+
+    save_manifest(args.output, manifest)
+    log.info(f"Manifest saved with {len(manifest['chunks'])} chunks")
 
 
 if __name__ == "__main__":
