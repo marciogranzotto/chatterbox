@@ -43,6 +43,49 @@ def parse_args():
     return parser.parse_args()
 
 
+def extract_voice_reference(audio_path: str, output_dir: str, start: float | None, end: float | None) -> str:
+    """Extract a voice reference clip from the source audiobook.
+
+    If start/end are provided, extracts that segment.
+    Otherwise, extracts a 10-second clip starting at 2 minutes
+    (skipping intros/music).
+
+    Returns path to the extracted reference.wav.
+    """
+    ref_path = os.path.join(output_dir, "reference.wav")
+
+    if os.path.exists(ref_path):
+        log.info(f"Voice reference already exists: {ref_path}")
+        return ref_path
+
+    if start is not None and end is not None:
+        duration = end - start
+        log.info(f"Extracting voice reference: {start}s to {end}s ({duration}s)")
+    else:
+        start = 120.0  # 2 minutes in — usually past intro music
+        duration = 10.0
+        log.info(f"No reference timestamps given, using default: {start}s to {start + duration}s")
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", str(start),
+        "-t", str(duration),
+        "-i", audio_path,
+        "-ac", "1",         # mono
+        "-ar", "24000",     # match Chatterbox output sample rate
+        "-acodec", "pcm_s16le",
+        ref_path,
+    ]
+    log.info(f"Running: {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        log.error(f"ffmpeg failed:\n{result.stderr}")
+        sys.exit(1)
+
+    log.info(f"Voice reference saved: {ref_path}")
+    return ref_path
+
+
 def main():
     args = parse_args()
     log.info("Audiobook translation pipeline starting")
@@ -51,7 +94,13 @@ def main():
     log.info(f"  Output: {args.output}")
     log.info(f"  Language: {args.lang}")
     log.info(f"  Resume: {args.resume}")
-    # Stages will be added in subsequent tasks
+    # Create output directory
+    os.makedirs(args.output, exist_ok=True)
+    os.makedirs(os.path.join(args.output, "chapters"), exist_ok=True)
+
+    # Stage 1a: Extract voice reference
+    ref_path = extract_voice_reference(args.audio, args.output, args.ref_start, args.ref_end)
+    log.info(f"Using voice reference: {ref_path}")
 
 
 if __name__ == "__main__":
