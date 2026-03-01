@@ -43,6 +43,7 @@ def parse_args():
     parser.add_argument("--dry-run", action="store_true", help="Parse and chunk only, skip TTS generation")
     parser.add_argument("--max-chunks", type=int, default=None, help="Limit generation to N chunks (for testing)")
     parser.add_argument("--retry-failed", action="store_true", help="Reset failed chunks to pending for retry")
+    parser.add_argument("--repetition-penalty", type=float, default=2.5, help="Repetition penalty for TTS (default: 2.5, model default is 2.0)")
     parser.add_argument("--skip-chapters", type=str, default=None,
                         help="Comma-separated chapter numbers (1-indexed) to skip, e.g. '1,2,3,48,49'")
     parser.add_argument("--start-chapter", type=int, default=None,
@@ -247,7 +248,7 @@ def save_manifest(output_dir: str, manifest: dict):
         json.dump(manifest, f, indent=2, ensure_ascii=False)
 
 
-def generate_chunks(manifest: dict, output_dir: str, ref_path: str, lang: str, max_chunks: int | None = None):
+def generate_chunks(manifest: dict, output_dir: str, ref_path: str, lang: str, max_chunks: int | None = None, repetition_penalty: float = 2.5):
     """Generate TTS audio for all pending chunks."""
     from chatterbox.mtl_tts import ChatterboxMultilingualTTS
 
@@ -289,6 +290,7 @@ def generate_chunks(manifest: dict, output_dir: str, ref_path: str, lang: str, m
                 language_id=lang,
                 temperature=0.8,
                 top_p=0.95,
+                repetition_penalty=repetition_penalty,
             )
 
             wav_path = chunk["wav_path"]
@@ -512,7 +514,7 @@ def main():
 
     if not args.dry_run:
         # Stage 2: Generate TTS audio
-        generate_chunks(manifest, args.output, ref_path, args.lang, args.max_chunks)
+        generate_chunks(manifest, args.output, ref_path, args.lang, args.max_chunks, args.repetition_penalty)
 
         # Stage 3: Assemble audiobook
         assemble_audiobook(manifest, args.output, args.chunk_silence, args.paragraph_silence, args.chapter_silence, lang=args.lang)
