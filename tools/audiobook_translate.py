@@ -86,6 +86,110 @@ def extract_voice_reference(audio_path: str, output_dir: str, start: float | Non
     return ref_path
 
 
+def parse_epub(epub_path: str) -> list[dict]:
+    """Parse an EPUB file and return chapters with their text.
+
+    Returns a list of dicts: [{"title": str, "paragraphs": [str, ...]}]
+    """
+    import ebooklib
+    from ebooklib import epub
+    from bs4 import BeautifulSoup
+
+    book = epub.read_epub(epub_path, options={"ignore_ncx": True})
+    chapters = []
+
+    for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
+        soup = BeautifulSoup(item.get_content(), "lxml")
+
+        # Extract text from paragraph tags
+        paragraphs = []
+        for p in soup.find_all(["p", "h1", "h2", "h3"]):
+            text = p.get_text(strip=True)
+            if text and len(text) > 1:  # skip empty or single-char paragraphs
+                paragraphs.append(text)
+
+        if not paragraphs:
+            continue
+
+        # Try to extract chapter title from headings
+        title_tag = soup.find(["h1", "h2", "h3"])
+        title = title_tag.get_text(strip=True) if title_tag else f"Chapter {len(chapters) + 1}"
+
+        chapters.append({"title": title, "paragraphs": paragraphs})
+
+    log.info(f"Parsed {len(chapters)} chapters from EPUB")
+    for i, ch in enumerate(chapters):
+        log.info(f"  Chapter {i+1}: '{ch['title']}' — {len(ch['paragraphs'])} paragraphs")
+
+    return chapters
+
+
+def chunk_text(text: str, max_chars: int = 500) -> list[str]:
+    """Split text into chunks suitable for TTS generation.
+
+    Strategy:
+    1. If text is under max_chars, return as-is
+    2. Otherwise split at sentence boundaries
+    3. If a sentence is still too long, split at clause boundaries
+    """
+    if len(text) <= max_chars:
+        return [text]
+
+    # Split at sentence boundaries
+    sentence_pattern = re.compile(r'(?<=[.!?])\s+')
+    sentences = sentence_pattern.split(text)
+
+    chunks = []
+    current = ""
+
+    for sentence in sentences:
+        if len(sentence) > max_chars:
+            # Split long sentence at clause boundaries
+            clause_pattern = re.compile(r'(?<=[,;])\s+|(?<=\s—\s)')
+            clauses = clause_pattern.split(sentence)
+            for clause in clauses:
+                if current and len(current) + len(clause) + 1 > max_chars:
+                    chunks.append(current.strip())
+                    current = clause
+                else:
+                    current = f"{current} {clause}".strip() if current else clause
+        elif current and len(current) + len(sentence) + 1 > max_chars:
+            chunks.append(current.strip())
+            current = sentence
+        else:
+            current = f"{current} {sentence}".strip() if current else sentence
+
+    if current.strip():
+        chunks.append(current.strip())
+
+    return chunks
+
+
+def build_chunk_list(chapters: list[dict]) -> list[dict]:
+    """Build a flat list of all text chunks with metadata.
+
+    Returns: [{"chapter_idx": int, "chapter_title": str, "paragraph_idx": int,
+               "chunk_idx": int, "text": str, "is_paragraph_end": bool}]
+    """
+    all_chunks = []
+
+    for ch_idx, chapter in enumerate(chapters):
+        for p_idx, paragraph in enumerate(chapter["paragraphs"]):
+            chunks = chunk_text(paragraph)
+            for c_idx, chunk in enumerate(chunks):
+                all_chunks.append({
+                    "chapter_idx": ch_idx,
+                    "chapter_title": chapter["title"],
+                    "paragraph_idx": p_idx,
+                    "chunk_idx": c_idx,
+                    "text": chunk,
+                    "is_paragraph_end": c_idx == len(chunks) - 1,
+                })
+
+    log.info(f"Total chunks: {len(all_chunks)}")
+    return all_chunks
+
+
 def main():
     args = parse_args()
     log.info("Audiobook translation pipeline starting")
@@ -101,6 +205,15 @@ def main():
     # Stage 1a: Extract voice reference
     ref_path = extract_voice_reference(args.audio, args.output, args.ref_start, args.ref_end)
     log.info(f"Using voice reference: {ref_path}")
+
+    # Stage 1b: Parse EPUB
+    chapters = parse_epub(args.ebook)
+    if not chapters:
+        log.error("No chapters found in EPUB")
+        sys.exit(1)
+
+    # Stage 1c: Build chunk list
+    all_chunks = build_chunk_list(chapters)
 
 
 if __name__ == "__main__":
