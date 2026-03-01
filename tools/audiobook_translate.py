@@ -42,6 +42,7 @@ def parse_args():
     parser.add_argument("--chapter-silence", type=float, default=2.0, help="Silence between chapters in seconds (default: 2.0)")
     parser.add_argument("--dry-run", action="store_true", help="Parse and chunk only, skip TTS generation")
     parser.add_argument("--max-chunks", type=int, default=None, help="Limit generation to N chunks (for testing)")
+    parser.add_argument("--retry-failed", action="store_true", help="Reset failed chunks to pending for retry")
     return parser.parse_args()
 
 
@@ -93,14 +94,16 @@ def parse_epub(epub_path: str) -> list[dict]:
 
     Returns a list of dicts: [{"title": str, "paragraphs": [str, ...]}]
     """
-    import ebooklib
     from ebooklib import epub
     from bs4 import BeautifulSoup
 
     book = epub.read_epub(epub_path, options={"ignore_ncx": True})
     chapters = []
 
-    for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
+    for item_id, _ in book.spine:
+        item = book.get_item_with_id(item_id)
+        if item is None:
+            continue
         soup = BeautifulSoup(item.get_content(), "lxml")
 
         # Extract text from paragraph tags
@@ -252,6 +255,11 @@ def generate_chunks(manifest: dict, output_dir: str, ref_path: str, lang: str, m
     model = ChatterboxMultilingualTTS.from_pretrained(device=device)
     log.info("Model loaded.")
 
+    # Pre-compute voice conditionals once to avoid re-embedding every chunk
+    log.info("Preparing voice conditionals from reference audio...")
+    model.prepare_conditionals(ref_path)
+    log.info("Voice conditionals ready.")
+
     pending = [(cid, c) for cid, c in manifest["chunks"].items() if c["status"] == "pending"]
 
     if max_chunks is not None:
@@ -271,7 +279,6 @@ def generate_chunks(manifest: dict, output_dir: str, ref_path: str, lang: str, m
             wav = model.generate(
                 text=chunk["text"],
                 language_id=lang,
-                audio_prompt_path=ref_path,
                 temperature=0.8,
                 top_p=0.95,
             )
@@ -301,7 +308,7 @@ def make_silence(duration_secs: float, sample_rate: int = 24000) -> torch.Tensor
     return torch.zeros(1, num_samples)
 
 
-def assemble_audiobook(manifest: dict, output_dir: str, chunk_silence: float, paragraph_silence: float, chapter_silence: float):
+def assemble_audiobook(manifest: dict, output_dir: str, chunk_silence: float, paragraph_silence: float, chapter_silence: float, lang: str = "pt"):
     """Concatenate all generated chunks into chapter files and a final audiobook."""
     sample_rate = 24000  # Chatterbox output SR
 
@@ -319,8 +326,6 @@ def assemble_audiobook(manifest: dict, output_dir: str, chunk_silence: float, pa
         log.error("No completed chunks to assemble")
         return
 
-    chapter_wavs = []
-
     for ch_idx in sorted(chapters.keys()):
         chunks = chapters[ch_idx]
         ch_title = chunks[0]["chapter_title"]
@@ -337,26 +342,46 @@ def assemble_audiobook(manifest: dict, output_dir: str, chunk_silence: float, pa
             else:
                 parts.append(make_silence(chunk_silence, sample_rate))
 
-        # Concatenate chapter
+        # Concatenate chapter in memory and save
         chapter_audio = torch.cat(parts, dim=1)
         chapter_path = os.path.join(output_dir, "chapters", f"ch{ch_idx:03d}.wav")
         ta.save(chapter_path, chapter_audio, sample_rate)
         log.info(f"  Saved chapter: {chapter_path} ({chapter_audio.shape[1] / sample_rate:.1f}s)")
+        del chapter_audio, parts  # free memory before next chapter
 
-        chapter_wavs.append(chapter_audio)
-        chapter_wavs.append(make_silence(chapter_silence, sample_rate))
+    # Use ffmpeg concat to join chapter WAVs into final audiobook
+    concat_list_path = os.path.join(output_dir, "concat_list.txt")
+    silence_path = os.path.join(output_dir, "chapter_silence.wav")
 
-    # Concatenate all chapters into final audiobook
-    final_audio = torch.cat(chapter_wavs, dim=1)
-    final_path = os.path.join(output_dir, "audiobook_pt.wav")
-    ta.save(final_path, final_audio, sample_rate)
+    # Save chapter silence as a WAV file
+    silence = make_silence(chapter_silence, sample_rate)
+    ta.save(silence_path, silence, sample_rate)
 
-    duration_mins = final_audio.shape[1] / sample_rate / 60
-    log.info(f"Final audiobook saved: {final_path} ({duration_mins:.1f} minutes)")
+    with open(concat_list_path, "w") as f:
+        for i, ch_idx in enumerate(sorted(chapters.keys())):
+            chapter_path = os.path.join(output_dir, "chapters", f"ch{ch_idx:03d}.wav")
+            f.write(f"file '{os.path.abspath(chapter_path)}'\n")
+            if i < len(chapters) - 1:  # no silence after last chapter
+                f.write(f"file '{os.path.abspath(silence_path)}'\n")
+
+    final_path = os.path.join(output_dir, f"audiobook_{lang}.wav")
+    cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list_path, "-c", "copy", final_path]
+    log.info(f"Running: {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        log.error(f"ffmpeg concat failed:\n{result.stderr}")
+        return
+
+    log.info(f"Final audiobook saved: {final_path}")
 
 
 def main():
     args = parse_args()
+
+    if (args.ref_start is None) != (args.ref_end is None):
+        log.error("--ref-start and --ref-end must both be provided, or both omitted")
+        sys.exit(1)
+
     log.info("Audiobook translation pipeline starting")
     log.info(f"  Audio: {args.audio}")
     log.info(f"  Ebook: {args.ebook}")
@@ -392,6 +417,15 @@ def main():
     else:
         manifest = create_manifest(args.output, all_chunks)
 
+    if args.retry_failed:
+        reset_count = 0
+        for cid, chunk in manifest["chunks"].items():
+            if chunk["status"] == "failed":
+                chunk["status"] = "pending"
+                reset_count += 1
+        if reset_count:
+            log.info(f"Reset {reset_count} failed chunks to pending for retry")
+
     save_manifest(args.output, manifest)
     log.info(f"Manifest saved with {len(manifest['chunks'])} chunks")
 
@@ -400,7 +434,7 @@ def main():
         generate_chunks(manifest, args.output, ref_path, args.lang, args.max_chunks)
 
         # Stage 3: Assemble audiobook
-        assemble_audiobook(manifest, args.output, args.chunk_silence, args.paragraph_silence, args.chapter_silence)
+        assemble_audiobook(manifest, args.output, args.chunk_silence, args.paragraph_silence, args.chapter_silence, lang=args.lang)
     else:
         log.info("Dry run — skipping TTS generation and assembly")
         log.info(f"Would generate {len(manifest['chunks'])} chunks")
