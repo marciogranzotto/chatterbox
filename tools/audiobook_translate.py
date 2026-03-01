@@ -288,6 +288,66 @@ def generate_chunks(manifest: dict, output_dir: str, ref_path: str, lang: str):
     log.info(f"Generation complete: {done_total} done, {failed} failed, {total} total")
 
 
+def make_silence(duration_secs: float, sample_rate: int = 24000) -> torch.Tensor:
+    """Create a silence tensor."""
+    num_samples = int(duration_secs * sample_rate)
+    return torch.zeros(1, num_samples)
+
+
+def assemble_audiobook(manifest: dict, output_dir: str, chunk_silence: float, paragraph_silence: float, chapter_silence: float):
+    """Concatenate all generated chunks into chapter files and a final audiobook."""
+    sample_rate = 24000  # Chatterbox output SR
+
+    # Group chunks by chapter
+    chapters: dict[int, list] = {}
+    for cid, chunk in sorted(manifest["chunks"].items()):
+        if chunk["status"] != "done":
+            continue
+        ch_idx = chunk["chapter_idx"]
+        if ch_idx not in chapters:
+            chapters[ch_idx] = []
+        chapters[ch_idx].append(chunk)
+
+    if not chapters:
+        log.error("No completed chunks to assemble")
+        return
+
+    chapter_wavs = []
+
+    for ch_idx in sorted(chapters.keys()):
+        chunks = chapters[ch_idx]
+        ch_title = chunks[0]["chapter_title"]
+        log.info(f"Assembling chapter {ch_idx}: '{ch_title}' ({len(chunks)} chunks)")
+
+        parts = []
+        for chunk in chunks:
+            wav, sr = ta.load(chunk["wav_path"])
+            parts.append(wav)
+
+            # Add appropriate silence
+            if chunk["is_paragraph_end"]:
+                parts.append(make_silence(paragraph_silence, sample_rate))
+            else:
+                parts.append(make_silence(chunk_silence, sample_rate))
+
+        # Concatenate chapter
+        chapter_audio = torch.cat(parts, dim=1)
+        chapter_path = os.path.join(output_dir, "chapters", f"ch{ch_idx:03d}.wav")
+        ta.save(chapter_path, chapter_audio, sample_rate)
+        log.info(f"  Saved chapter: {chapter_path} ({chapter_audio.shape[1] / sample_rate:.1f}s)")
+
+        chapter_wavs.append(chapter_audio)
+        chapter_wavs.append(make_silence(chapter_silence, sample_rate))
+
+    # Concatenate all chapters into final audiobook
+    final_audio = torch.cat(chapter_wavs, dim=1)
+    final_path = os.path.join(output_dir, "audiobook_pt.wav")
+    ta.save(final_path, final_audio, sample_rate)
+
+    duration_mins = final_audio.shape[1] / sample_rate / 60
+    log.info(f"Final audiobook saved: {final_path} ({duration_mins:.1f} minutes)")
+
+
 def main():
     args = parse_args()
     log.info("Audiobook translation pipeline starting")
@@ -330,6 +390,11 @@ def main():
 
     # Stage 2: Generate TTS audio
     generate_chunks(manifest, args.output, ref_path, args.lang)
+
+    # Stage 3: Assemble audiobook
+    assemble_audiobook(manifest, args.output, args.chunk_silence, args.paragraph_silence, args.chapter_silence)
+
+    log.info("Pipeline complete!")
 
 
 if __name__ == "__main__":
