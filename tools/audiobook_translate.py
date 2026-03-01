@@ -316,6 +316,38 @@ def make_silence(duration_secs: float, sample_rate: int = 24000) -> torch.Tensor
     return torch.zeros(1, num_samples)
 
 
+def trim_audio(wav: torch.Tensor, sample_rate: int = 24000, threshold: float = 0.01, min_silence_ms: int = 200) -> torch.Tensor:
+    """Trim trailing low-energy audio (silence and generation artifacts).
+
+    Scans from the end in 50ms windows. Trims everything after the last
+    window that exceeds the energy threshold, keeping a small tail of
+    min_silence_ms for natural fade-out.
+    """
+    window = int(0.05 * sample_rate)  # 50ms
+    n_windows = wav.shape[1] // window
+
+    # Find last window with energy above threshold (scanning from end)
+    last_active = n_windows  # default: keep everything
+    for i in range(n_windows):
+        start = wav.shape[1] - (i + 1) * window
+        end = wav.shape[1] - i * window
+        rms = torch.sqrt(torch.mean(wav[0, start:end] ** 2)).item()
+        if rms >= threshold:
+            last_active = n_windows - i
+            break
+
+    # Keep up to last_active windows + a small silence tail
+    tail_samples = int(min_silence_ms / 1000.0 * sample_rate)
+    trim_point = min(last_active * window + tail_samples, wav.shape[1])
+    trimmed = wav[:, :trim_point]
+
+    trimmed_ms = (wav.shape[1] - trimmed.shape[1]) / sample_rate * 1000
+    if trimmed_ms > 100:
+        log.debug(f"  Trimmed {trimmed_ms:.0f}ms from end")
+
+    return trimmed
+
+
 def assemble_audiobook(manifest: dict, output_dir: str, chunk_silence: float, paragraph_silence: float, chapter_silence: float, lang: str = "pt"):
     """Concatenate all generated chunks into chapter files and a final audiobook."""
     sample_rate = 24000  # Chatterbox output SR
@@ -342,6 +374,7 @@ def assemble_audiobook(manifest: dict, output_dir: str, chunk_silence: float, pa
         parts = []
         for chunk in chunks:
             wav, sr = ta.load(chunk["wav_path"])
+            wav = trim_audio(wav, sample_rate)
             parts.append(wav)
 
             # Add appropriate silence
