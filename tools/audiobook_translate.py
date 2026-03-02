@@ -863,25 +863,30 @@ def main():
     full_manifest = None  # Track full manifest when filtering on resume
 
     if args.resume:
-        manifest = load_manifest(args.output)
-        if manifest:
-            # Filter manifest to only selected chapters
-            if selected_chapter_idxs != {c["chapter_idx"] for c in manifest["chunks"].values()}:
-                full_manifest = manifest
-                filtered_chunks = {
-                    cid: chunk for cid, chunk in manifest["chunks"].items()
-                    if chunk["chapter_idx"] in selected_chapter_idxs
-                }
-                skipped = len(manifest["chunks"]) - len(filtered_chunks)
-                manifest = {**manifest, "chunks": filtered_chunks}
-                if skipped:
-                    log.info(f"Filtered to selected chapters: skipped {skipped} chunks outside range")
+        old_manifest = load_manifest(args.output)
+        # Always build a fresh manifest from the current chunk list
+        manifest = create_manifest(args.output, all_chunks)
+        if old_manifest:
+            # Carry over statuses from previous run for matching chunks
+            carried = 0
+            for cid in manifest["chunks"]:
+                if cid in old_manifest["chunks"]:
+                    old_status = old_manifest["chunks"][cid]["status"]
+                    if old_status in ("done", "failed"):
+                        manifest["chunks"][cid]["status"] = old_status
+                        carried += 1
+
+            # If old manifest has chunks outside current selection, preserve them for saving
+            extra_cids = set(old_manifest["chunks"].keys()) - set(manifest["chunks"].keys())
+            if extra_cids:
+                full_manifest = old_manifest
+                log.info(f"  {len(extra_cids)} chunks from other chapters preserved")
+
             done = sum(1 for c in manifest["chunks"].values() if c["status"] == "done")
             total = len(manifest["chunks"])
-            log.info(f"Resuming: {done}/{total} chunks already done")
+            log.info(f"Resuming: {done}/{total} chunks done ({carried} carried from previous run)")
         else:
             log.warning("--resume given but no manifest found, starting fresh")
-            manifest = create_manifest(args.output, all_chunks)
     else:
         manifest = create_manifest(args.output, all_chunks)
 
