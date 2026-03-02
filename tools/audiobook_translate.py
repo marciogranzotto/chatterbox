@@ -44,12 +44,22 @@ def parse_args():
     parser.add_argument("--max-chunks", type=int, default=None, help="Limit generation to N chunks (for testing)")
     parser.add_argument("--retry-failed", action="store_true", help="Reset failed chunks to pending for retry")
     parser.add_argument("--repetition-penalty", type=float, default=2.5, help="Repetition penalty for TTS (default: 2.5, model default is 2.0)")
+    parser.add_argument("--exaggeration", type=float, default=0.7, help="Expressiveness/emotion level (default: 0.7, model default is 0.5)")
+    parser.add_argument("--cfg-weight", type=float, default=0.5, help="Classifier-free guidance weight (default: 0.5)")
+    parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature (default: 0.8)")
     parser.add_argument("--skip-chapters", type=str, default=None,
                         help="Comma-separated chapter numbers (1-indexed) to skip, e.g. '1,2,3,48,49'")
     parser.add_argument("--start-chapter", type=int, default=None,
                         help="First chapter number (1-indexed) to include")
     parser.add_argument("--end-chapter", type=int, default=None,
                         help="Last chapter number (1-indexed) to include")
+    parser.add_argument("--align-audio", action="store_true",
+                        help="Use segment-aligned references: match each Portuguese chunk to its "
+                             "corresponding position in the English audio for tone/emotion matching")
+    parser.add_argument("--whisper-model", type=str, default="base",
+                        help="Whisper model size for transcription (default: base). Options: tiny, base, small, medium, large")
+    parser.add_argument("--ref-duration", type=float, default=10.0,
+                        help="Duration in seconds for each aligned reference clip (default: 10.0)")
     return parser.parse_args()
 
 
@@ -136,6 +146,248 @@ def parse_epub(epub_path: str) -> list[dict]:
         log.info(f"  Chapter {i+1}: '{ch['title']}' — {len(ch['paragraphs'])} paragraphs")
 
     return chapters
+
+
+def transcribe_audio(audio_path: str, output_dir: str, model_size: str = "base") -> list[dict]:
+    """Transcribe the English audiobook with Whisper to get timestamped segments.
+
+    Returns list of segments: [{"start": float, "end": float, "text": str}]
+    Caches the transcript as JSON to avoid re-transcription.
+    """
+    transcript_path = os.path.join(output_dir, "whisper_transcript.json")
+
+    if os.path.exists(transcript_path):
+        log.info(f"Loading cached Whisper transcript: {transcript_path}")
+        with open(transcript_path) as f:
+            return json.load(f)
+
+    # Convert to wav first for reliability (Whisper's ffmpeg handling can be fragile with m4b)
+    wav_path = os.path.join(output_dir, "source_audio.wav")
+    if not os.path.exists(wav_path):
+        log.info("Converting source audio to WAV for Whisper...")
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", audio_path,
+            "-ac", "1",
+            "-ar", "16000",
+            "-acodec", "pcm_s16le",
+            wav_path,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            log.error(f"ffmpeg conversion failed:\n{result.stderr}")
+            sys.exit(1)
+        log.info(f"Converted to: {wav_path}")
+
+    import whisper
+    if torch.cuda.is_available():
+        whisper_device = "cuda"
+    else:
+        whisper_device = "cpu"
+    log.info(f"Transcribing with Whisper ({model_size}) on {whisper_device}...")
+    log.info("  (This handles long files natively via 30s sliding windows)")
+    w_model = whisper.load_model(model_size, device=whisper_device)
+    result = w_model.transcribe(wav_path, language="en", verbose=True, fp16=(whisper_device == "cuda"))
+    del w_model
+
+    segments = []
+    for seg in result["segments"]:
+        segments.append({
+            "start": seg["start"],
+            "end": seg["end"],
+            "text": seg["text"].strip(),
+        })
+
+    # Cache transcript
+    with open(transcript_path, "w") as f:
+        json.dump(segments, f, indent=2)
+
+    total_duration = segments[-1]["end"] if segments else 0
+    log.info(f"Transcription complete: {len(segments)} segments, {total_duration/3600:.1f} hours")
+
+    # Clean up intermediate WAV (large file)
+    if os.path.exists(wav_path):
+        os.remove(wav_path)
+        log.info("Cleaned up intermediate WAV file")
+
+    return segments
+
+
+def detect_chapter_boundaries(segments: list[dict], epub_chapters: list[dict]) -> list[dict]:
+    """Detect chapter boundaries in the Whisper transcript by matching chapter titles.
+
+    Returns list of chapter ranges: [{"title": str, "audio_start": float, "audio_end": float, "epub_idx": int}]
+    """
+    chapter_ranges = []
+
+    # Build list of chapter titles to search for (normalized)
+    titles = []
+    for i, ch in enumerate(epub_chapters):
+        # Normalize: lowercase, strip, collapse whitespace
+        title = " ".join(ch["title"].lower().split())
+        titles.append((i, title, ch["title"]))
+
+    # Search for each title in the transcript segments
+    # We look for segments whose text contains the chapter title
+    total_duration = segments[-1]["end"] if segments else 0
+
+    found_boundaries = []
+    for epub_idx, norm_title, orig_title in titles:
+        # Skip very short/generic titles
+        if len(norm_title) < 3:
+            continue
+
+        for seg in segments:
+            seg_text = " ".join(seg["text"].lower().split())
+            # Check if segment text matches chapter title
+            if norm_title in seg_text or seg_text in norm_title:
+                found_boundaries.append({
+                    "epub_idx": epub_idx,
+                    "title": orig_title,
+                    "audio_start": seg["start"],
+                })
+                break
+
+    if not found_boundaries:
+        # Fallback: divide audio equally among chapters
+        log.warning("Could not detect chapter boundaries from transcript, using proportional split")
+        chapter_duration = total_duration / len(epub_chapters)
+        for i, ch in enumerate(epub_chapters):
+            chapter_ranges.append({
+                "title": ch["title"],
+                "audio_start": i * chapter_duration,
+                "audio_end": (i + 1) * chapter_duration,
+                "epub_idx": i,
+            })
+        return chapter_ranges
+
+    # Sort by audio position
+    found_boundaries.sort(key=lambda x: x["audio_start"])
+
+    # Fill in end times (each chapter ends where the next begins)
+    for i, boundary in enumerate(found_boundaries):
+        if i + 1 < len(found_boundaries):
+            boundary["audio_end"] = found_boundaries[i + 1]["audio_start"]
+        else:
+            boundary["audio_end"] = total_duration
+        chapter_ranges.append(boundary)
+
+    log.info(f"Detected {len(chapter_ranges)} chapter boundaries in audio:")
+    for cr in chapter_ranges[:5]:
+        dur = (cr["audio_end"] - cr["audio_start"]) / 60
+        log.info(f"  '{cr['title']}': {cr['audio_start']:.0f}s - {cr['audio_end']:.0f}s ({dur:.1f}min)")
+    if len(chapter_ranges) > 5:
+        log.info(f"  ... and {len(chapter_ranges) - 5} more")
+
+    return chapter_ranges
+
+
+def compute_aligned_references(manifest: dict, chapter_ranges: list[dict],
+                                audio_path: str, output_dir: str,
+                                ref_duration: float = 10.0) -> dict[str, str]:
+    """Compute per-chunk reference audio clips based on proportional alignment.
+
+    For each chunk, calculates its proportional position within its chapter,
+    maps that to the corresponding position in the English audio, and extracts
+    a reference clip.
+
+    Returns: dict mapping chunk_id -> reference wav path
+    """
+    refs_dir = os.path.join(output_dir, "aligned_refs")
+    os.makedirs(refs_dir, exist_ok=True)
+
+    # Build a mapping from epub chapter index to audio range
+    epub_to_audio = {}
+    for cr in chapter_ranges:
+        epub_to_audio[cr["epub_idx"]] = cr
+
+    # Group chunks by chapter and count total text length per chapter
+    chapter_chunks: dict[int, list[tuple[str, dict]]] = {}
+    for cid, chunk in manifest["chunks"].items():
+        ch_idx = chunk["chapter_idx"]
+        if ch_idx not in chapter_chunks:
+            chapter_chunks[ch_idx] = []
+        chapter_chunks[ch_idx].append((cid, chunk))
+
+    # Sort within each chapter
+    for ch_idx in chapter_chunks:
+        chapter_chunks[ch_idx].sort(key=lambda x: x[0])
+
+    ref_map = {}
+    total_audio_duration = max(cr["audio_end"] for cr in chapter_ranges)
+
+    for ch_idx, chunks in chapter_chunks.items():
+        # Find the audio range for this chapter
+        if ch_idx in epub_to_audio:
+            audio_range = epub_to_audio[ch_idx]
+        else:
+            # Chapter not found in audio — use proportional fallback
+            n_chapters = max(chapter_chunks.keys()) + 1
+            ch_start = (ch_idx / n_chapters) * total_audio_duration
+            ch_end = ((ch_idx + 1) / n_chapters) * total_audio_duration
+            audio_range = {"audio_start": ch_start, "audio_end": ch_end}
+
+        ch_audio_start = audio_range["audio_start"]
+        ch_audio_end = audio_range["audio_end"]
+        ch_audio_duration = ch_audio_end - ch_audio_start
+
+        # Calculate cumulative text length for proportional positioning
+        total_text_len = sum(len(c["text"]) for _, c in chunks)
+        cumulative_len = 0
+
+        for cid, chunk in chunks:
+            # Position of this chunk as fraction through the chapter
+            fraction = cumulative_len / total_text_len if total_text_len > 0 else 0
+            cumulative_len += len(chunk["text"])
+
+            # Map to audio position
+            audio_pos = ch_audio_start + fraction * ch_audio_duration
+
+            # Center the reference clip around this position
+            ref_start = max(0, audio_pos - ref_duration / 2)
+            ref_end = ref_start + ref_duration
+            # Don't exceed chapter bounds
+            if ref_end > ch_audio_end:
+                ref_end = ch_audio_end
+                ref_start = max(0, ref_end - ref_duration)
+
+            ref_path = os.path.join(refs_dir, f"{cid}_ref.wav")
+            ref_map[cid] = {
+                "path": ref_path,
+                "start": ref_start,
+                "end": ref_end,
+            }
+
+    # Extract all reference clips via ffmpeg (batch for efficiency)
+    existing = sum(1 for v in ref_map.values() if os.path.exists(v["path"]))
+    to_extract = {cid: v for cid, v in ref_map.items() if not os.path.exists(v["path"])}
+
+    if existing:
+        log.info(f"  {existing} aligned references already cached")
+
+    if to_extract:
+        log.info(f"Extracting {len(to_extract)} aligned reference clips...")
+        for i, (cid, ref_info) in enumerate(to_extract.items()):
+            if (i + 1) % 100 == 0 or i == 0:
+                log.info(f"  Extracting reference {i+1}/{len(to_extract)}...")
+            cmd = [
+                "ffmpeg", "-y",
+                "-ss", str(ref_info["start"]),
+                "-t", str(ref_info["end"] - ref_info["start"]),
+                "-i", audio_path,
+                "-ac", "1",
+                "-ar", "24000",
+                "-acodec", "pcm_s16le",
+                ref_info["path"],
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                log.warning(f"  Failed to extract ref for {cid}: {result.stderr[:100]}")
+
+    log.info(f"Aligned references ready: {len(ref_map)} clips")
+
+    # Return just the path mapping
+    return {cid: v["path"] for cid, v in ref_map.items()}
 
 
 def chunk_text(text: str, max_chars: int = 500) -> list[str]:
@@ -248,8 +500,14 @@ def save_manifest(output_dir: str, manifest: dict):
         json.dump(manifest, f, indent=2, ensure_ascii=False)
 
 
-def generate_chunks(manifest: dict, output_dir: str, ref_path: str, lang: str, max_chunks: int | None = None, repetition_penalty: float = 2.5):
-    """Generate TTS audio for all pending chunks."""
+def generate_chunks(manifest: dict, output_dir: str, ref_path: str, lang: str,
+                    max_chunks: int | None = None, repetition_penalty: float = 2.5,
+                    exaggeration: float = 0.7, cfg_weight: float = 0.5,
+                    temperature: float = 0.8, aligned_refs: dict[str, str] | None = None):
+    """Generate TTS audio for all pending chunks.
+
+    If aligned_refs is provided, uses per-chunk reference clips instead of a single global reference.
+    """
     from chatterbox.mtl_tts import ChatterboxMultilingualTTS
 
     # Determine device
@@ -264,10 +522,15 @@ def generate_chunks(manifest: dict, output_dir: str, ref_path: str, lang: str, m
     model = ChatterboxMultilingualTTS.from_pretrained(device=device)
     log.info("Model loaded.")
 
-    # Pre-compute voice conditionals once to avoid re-embedding every chunk
-    log.info("Preparing voice conditionals from reference audio...")
-    model.prepare_conditionals(ref_path)
-    log.info("Voice conditionals ready.")
+    if aligned_refs:
+        log.info("Using segment-aligned per-chunk references")
+        # Prepare initial conditionals from global ref as fallback
+        model.prepare_conditionals(ref_path, exaggeration=exaggeration)
+    else:
+        # Pre-compute voice conditionals once to avoid re-embedding every chunk
+        log.info(f"Preparing voice conditionals from reference audio (exaggeration={exaggeration})...")
+        model.prepare_conditionals(ref_path, exaggeration=exaggeration)
+        log.info("Voice conditionals ready.")
 
     pending = [(cid, c) for cid, c in manifest["chunks"].items() if c["status"] == "pending"]
 
@@ -285,13 +548,32 @@ def generate_chunks(manifest: dict, output_dir: str, ref_path: str, lang: str, m
         log.info(f"[{progress}/{total}] Generating {cid}: {chunk['text'][:60]}...")
 
         try:
-            wav = model.generate(
-                text=chunk["text"],
-                language_id=lang,
-                temperature=0.8,
-                top_p=0.95,
-                repetition_penalty=repetition_penalty,
-            )
+            # Use aligned reference if available, otherwise use global ref
+            chunk_ref = None
+            if aligned_refs and cid in aligned_refs:
+                chunk_ref = aligned_refs[cid]
+                if not os.path.exists(chunk_ref):
+                    chunk_ref = None  # fall back to pre-computed conditionals
+
+            if chunk_ref:
+                wav = model.generate(
+                    text=chunk["text"],
+                    language_id=lang,
+                    audio_prompt_path=chunk_ref,
+                    temperature=temperature,
+                    cfg_weight=cfg_weight,
+                    exaggeration=exaggeration,
+                    repetition_penalty=repetition_penalty,
+                )
+            else:
+                wav = model.generate(
+                    text=chunk["text"],
+                    language_id=lang,
+                    temperature=temperature,
+                    cfg_weight=cfg_weight,
+                    exaggeration=exaggeration,
+                    repetition_penalty=repetition_penalty,
+                )
 
             wav_path = chunk["wav_path"]
             os.makedirs(os.path.dirname(wav_path), exist_ok=True)
@@ -512,15 +794,36 @@ def main():
     save_manifest(args.output, manifest)
     log.info(f"Manifest saved with {len(manifest['chunks'])} chunks")
 
+    # Stage 1d: Segment alignment (optional)
+    aligned_refs = None
+    if args.align_audio:
+        log.info("=== Segment-aligned mode: matching English audio to Portuguese chunks ===")
+        transcript = transcribe_audio(args.audio, args.output, model_size=args.whisper_model)
+        chapter_ranges = detect_chapter_boundaries(transcript, chapters)
+
+        # Save chapter ranges for debugging
+        ranges_path = os.path.join(args.output, "chapter_ranges.json")
+        with open(ranges_path, "w") as f:
+            json.dump(chapter_ranges, f, indent=2, ensure_ascii=False)
+        log.info(f"Chapter ranges saved: {ranges_path}")
+
+        aligned_refs = compute_aligned_references(
+            manifest, chapter_ranges, args.audio, args.output, ref_duration=args.ref_duration
+        )
+
     if not args.dry_run:
         # Stage 2: Generate TTS audio
-        generate_chunks(manifest, args.output, ref_path, args.lang, args.max_chunks, args.repetition_penalty)
+        generate_chunks(manifest, args.output, ref_path, args.lang, args.max_chunks,
+                        args.repetition_penalty, args.exaggeration, args.cfg_weight,
+                        args.temperature, aligned_refs=aligned_refs)
 
         # Stage 3: Assemble audiobook
         assemble_audiobook(manifest, args.output, args.chunk_silence, args.paragraph_silence, args.chapter_silence, lang=args.lang)
     else:
         log.info("Dry run — skipping TTS generation and assembly")
         log.info(f"Would generate {len(manifest['chunks'])} chunks")
+        if aligned_refs:
+            log.info(f"Would use {len(aligned_refs)} aligned reference clips")
 
     log.info("Pipeline complete!")
 
