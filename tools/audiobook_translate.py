@@ -43,6 +43,7 @@ def parse_args():
     parser.add_argument("--paragraph-silence", type=float, default=1.0, help="Silence between paragraphs in seconds (default: 1.0)")
     parser.add_argument("--chapter-silence", type=float, default=2.0, help="Silence between chapters in seconds (default: 2.0)")
     parser.add_argument("--dry-run", action="store_true", help="Parse and chunk only, skip TTS generation")
+    parser.add_argument("--assemble-only", action="store_true", help="Skip TTS generation, just assemble chapter/audiobook WAVs from existing chunks")
     parser.add_argument("--max-chunks", type=int, default=None, help="Limit generation to N chunks (for testing)")
     parser.add_argument("--retry-failed", action="store_true", help="Reset failed chunks to pending for retry")
     parser.add_argument("--repetition-penalty", type=float, default=2.5, help="Repetition penalty for TTS (default: 2.5, model default is 2.0)")
@@ -619,9 +620,11 @@ def generate_chunks(manifest: dict, output_dir: str, ref_path: str, lang: str,
                     max_chunks: int | None = None, repetition_penalty: float = 2.5,
                     exaggeration: float = 0.7, cfg_weight: float = 0.5,
                     temperature: float = 0.8, aligned_refs: dict[str, str] | None = None,
-                    full_manifest: dict = None):
+                    full_manifest: dict = None,
+                    chunk_silence: float = 0.3, paragraph_silence: float = 1.0):
     """Generate TTS audio for all pending chunks.
 
+    Assembles each chapter's audio as soon as all its chunks are done.
     If aligned_refs is provided, uses per-chunk reference clips instead of a single global reference.
     If full_manifest is provided, merges updates back when saving (for chapter-filtered resumes).
     """
@@ -729,6 +732,11 @@ def generate_chunks(manifest: dict, output_dir: str, ref_path: str, lang: str,
         # Save manifest after every chunk for resumability
         save_manifest(output_dir, manifest, full_manifest=full_manifest)
 
+        # Assemble chapter audio as soon as all its chunks are done
+        ch_idx = chunk["chapter_idx"]
+        if manifest["chunks"][cid]["status"] == "done" and is_chapter_complete(manifest, ch_idx):
+            assemble_chapter(manifest, output_dir, ch_idx, chunk_silence, paragraph_silence)
+
     done_total = sum(1 for c in manifest["chunks"].values() if c["status"] == "done")
     failed = sum(1 for c in manifest["chunks"].values() if c["status"] == "failed")
     log.info(f"Generation complete: {done_total} done, {failed} failed, {total} total")
@@ -800,61 +808,84 @@ def trim_audio(wav: torch.Tensor, sample_rate: int = 24000, threshold: float = 0
     return trimmed
 
 
-def assemble_audiobook(manifest: dict, output_dir: str, chunk_silence: float, paragraph_silence: float, chapter_silence: float, lang: str = "pt"):
-    """Concatenate all generated chunks into chapter files and a final audiobook."""
-    sample_rate = 24000  # Chatterbox output SR
+def assemble_chapter(manifest: dict, output_dir: str, ch_idx: int,
+                     chunk_silence: float, paragraph_silence: float,
+                     sample_rate: int = 24000) -> str | None:
+    """Assemble a single chapter from its generated chunks. Returns path or None."""
+    chunks = sorted(
+        [(cid, c) for cid, c in manifest["chunks"].items()
+         if c["chapter_idx"] == ch_idx and c["status"] == "done"],
+        key=lambda x: x[0]
+    )
+    if not chunks:
+        return None
 
-    # Group chunks by chapter
-    chapters: dict[int, list] = {}
-    for cid, chunk in sorted(manifest["chunks"].items()):
-        if chunk["status"] != "done":
-            continue
-        ch_idx = chunk["chapter_idx"]
-        if ch_idx not in chapters:
-            chapters[ch_idx] = []
-        chapters[ch_idx].append(chunk)
+    ch_title = chunks[0][1]["chapter_title"]
+    log.info(f"Assembling chapter {ch_idx}: '{ch_title}' ({len(chunks)} chunks)")
 
-    if not chapters:
+    parts = []
+    for cid, chunk in chunks:
+        wav, sr = ta.load(chunk["wav_path"])
+        wav = trim_audio(wav, sample_rate)
+        parts.append(wav)
+
+        # Add appropriate silence
+        if chunk["is_paragraph_end"]:
+            parts.append(make_silence(paragraph_silence, sample_rate))
+        else:
+            parts.append(make_silence(chunk_silence, sample_rate))
+
+    chapter_audio = torch.cat(parts, dim=1)
+    chapter_path = os.path.join(output_dir, "chapters", f"ch{ch_idx:03d}.wav")
+    ta.save(chapter_path, chapter_audio, sample_rate)
+    log.info(f"  Saved chapter: {chapter_path} ({chapter_audio.shape[1] / sample_rate:.1f}s)")
+    del chapter_audio, parts
+    return chapter_path
+
+
+def is_chapter_complete(manifest: dict, ch_idx: int) -> bool:
+    """Check if all chunks for a chapter are done."""
+    ch_chunks = [c for c in manifest["chunks"].values() if c["chapter_idx"] == ch_idx]
+    return ch_chunks and all(c["status"] == "done" for c in ch_chunks)
+
+
+def assemble_audiobook(manifest: dict, output_dir: str, chunk_silence: float,
+                       paragraph_silence: float, chapter_silence: float, lang: str = "pt"):
+    """Assemble per-chapter WAVs and concatenate into a final audiobook."""
+    sample_rate = 24000
+
+    # Find chapters with completed chunks
+    chapter_idxs = sorted(set(
+        c["chapter_idx"] for c in manifest["chunks"].values() if c["status"] == "done"
+    ))
+    if not chapter_idxs:
         log.error("No completed chunks to assemble")
         return
 
-    for ch_idx in sorted(chapters.keys()):
-        chunks = chapters[ch_idx]
-        ch_title = chunks[0]["chapter_title"]
-        log.info(f"Assembling chapter {ch_idx}: '{ch_title}' ({len(chunks)} chunks)")
-
-        parts = []
-        for chunk in chunks:
-            wav, sr = ta.load(chunk["wav_path"])
-            wav = trim_audio(wav, sample_rate)
-            parts.append(wav)
-
-            # Add appropriate silence
-            if chunk["is_paragraph_end"]:
-                parts.append(make_silence(paragraph_silence, sample_rate))
-            else:
-                parts.append(make_silence(chunk_silence, sample_rate))
-
-        # Concatenate chapter in memory and save
-        chapter_audio = torch.cat(parts, dim=1)
+    # Assemble any chapters that don't have a WAV yet
+    for ch_idx in chapter_idxs:
         chapter_path = os.path.join(output_dir, "chapters", f"ch{ch_idx:03d}.wav")
-        ta.save(chapter_path, chapter_audio, sample_rate)
-        log.info(f"  Saved chapter: {chapter_path} ({chapter_audio.shape[1] / sample_rate:.1f}s)")
-        del chapter_audio, parts  # free memory before next chapter
+        if not os.path.exists(chapter_path) and is_chapter_complete(manifest, ch_idx):
+            assemble_chapter(manifest, output_dir, ch_idx, chunk_silence, paragraph_silence)
 
-    # Use ffmpeg concat to join chapter WAVs into final audiobook
+    # Concatenate all chapter WAVs into final audiobook
+    available = [idx for idx in chapter_idxs
+                 if os.path.exists(os.path.join(output_dir, "chapters", f"ch{idx:03d}.wav"))]
+    if not available:
+        log.error("No chapter WAVs found to concatenate")
+        return
+
     concat_list_path = os.path.join(output_dir, "concat_list.txt")
     silence_path = os.path.join(output_dir, "chapter_silence.wav")
 
-    # Save chapter silence as a WAV file
     silence = make_silence(chapter_silence, sample_rate)
     ta.save(silence_path, silence, sample_rate)
 
     with open(concat_list_path, "w") as f:
-        for i, ch_idx in enumerate(sorted(chapters.keys())):
+        for i, ch_idx in enumerate(available):
             chapter_path = os.path.join(output_dir, "chapters", f"ch{ch_idx:03d}.wav")
             f.write(f"file '{os.path.abspath(chapter_path)}'\n")
-            if i < len(chapters) - 1:  # no silence after last chapter
+            if i < len(available) - 1:
                 f.write(f"file '{os.path.abspath(silence_path)}'\n")
 
     final_path = os.path.join(output_dir, f"audiobook_{lang}.wav")
@@ -972,20 +1003,26 @@ def main():
             manifest, chapter_ranges, args.audio, args.output, ref_duration=args.ref_duration
         )
 
-    if not args.dry_run:
-        # Stage 2: Generate TTS audio
-        generate_chunks(manifest, args.output, ref_path, args.lang, args.max_chunks,
-                        args.repetition_penalty, args.exaggeration, args.cfg_weight,
-                        args.temperature, aligned_refs=aligned_refs,
-                        full_manifest=full_manifest)
-
-        # Stage 3: Assemble audiobook
-        assemble_audiobook(manifest, args.output, args.chunk_silence, args.paragraph_silence, args.chapter_silence, lang=args.lang)
-    else:
+    if args.dry_run:
         log.info("Dry run — skipping TTS generation and assembly")
         log.info(f"Would generate {len(manifest['chunks'])} chunks")
         if aligned_refs:
             log.info(f"Would use {len(aligned_refs)} aligned reference clips")
+    elif args.assemble_only:
+        # Skip TTS, just assemble from existing chunk WAVs
+        log.info("Assemble-only mode — skipping TTS generation")
+        assemble_audiobook(manifest, args.output, args.chunk_silence, args.paragraph_silence, args.chapter_silence, lang=args.lang)
+    else:
+        # Stage 2: Generate TTS audio (assembles chapters as they complete)
+        generate_chunks(manifest, args.output, ref_path, args.lang, args.max_chunks,
+                        args.repetition_penalty, args.exaggeration, args.cfg_weight,
+                        args.temperature, aligned_refs=aligned_refs,
+                        full_manifest=full_manifest,
+                        chunk_silence=args.chunk_silence,
+                        paragraph_silence=args.paragraph_silence)
+
+        # Stage 3: Final audiobook concatenation
+        assemble_audiobook(manifest, args.output, args.chunk_silence, args.paragraph_silence, args.chapter_silence, lang=args.lang)
 
     elapsed = time.time() - start_time
     hours, remainder = divmod(int(elapsed), 3600)

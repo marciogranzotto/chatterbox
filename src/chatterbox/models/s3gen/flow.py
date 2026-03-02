@@ -162,7 +162,8 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         mask = (~make_pad_mask(token_len)).unsqueeze(-1).to(embedding)
 
         if (token >= self.vocab_size).any():
-            logger.error(f"{token.max()}>{self.vocab_size}\n out-of-range special tokens found in flow, fix inputs!")
+            logger.warning(f"{token.max()}>{self.vocab_size}\n out-of-range special tokens found in flow, clamping to valid range")
+            token = torch.clamp(token, min=0, max=self.vocab_size - 1)
         token = self.input_embedding(token.long()) * mask
 
         # text encode
