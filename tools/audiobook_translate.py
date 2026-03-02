@@ -565,9 +565,39 @@ def create_manifest(output_dir: str, chunks: list[dict]) -> dict:
 def load_manifest(output_dir: str) -> dict | None:
     """Load an existing manifest if it exists."""
     manifest_path = os.path.join(output_dir, "manifest.json")
-    if os.path.exists(manifest_path):
-        with open(manifest_path, encoding="utf-8") as f:
-            return json.load(f)
+    if not os.path.exists(manifest_path):
+        return None
+
+    # Try UTF-8 first, fall back to latin-1 for manifests written before the encoding fix
+    for encoding in ("utf-8", "latin-1"):
+        try:
+            with open(manifest_path, encoding=encoding) as f:
+                manifest = json.load(f)
+            if encoding != "utf-8":
+                log.warning(f"Manifest loaded with {encoding} fallback (pre-encoding-fix file)")
+            return manifest
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+
+    # Last resort: manifest is truncated/corrupted JSON — recover chunk statuses via regex
+    log.warning("Manifest JSON is corrupted, attempting to recover chunk statuses...")
+    try:
+        with open(manifest_path, encoding="latin-1") as f:
+            raw = f.read()
+        # Extract chunk IDs and their statuses from the raw text
+        recovered = {"version": 1, "chunks": {}}
+        pattern = re.compile(r'"(ch\d+_p\d+_c\d+)":\s*\{[^}]*"status":\s*"(\w+)"', re.DOTALL)
+        for match in pattern.finditer(raw):
+            cid, status = match.group(1), match.group(2)
+            recovered["chunks"][cid] = {"status": status}
+        if recovered["chunks"]:
+            done = sum(1 for c in recovered["chunks"].values() if c["status"] == "done")
+            log.info(f"Recovered {len(recovered['chunks'])} chunks ({done} done) from corrupted manifest")
+            return recovered
+    except Exception as e:
+        log.error(f"Recovery failed: {e}")
+
+    log.error(f"Could not parse manifest: {manifest_path}")
     return None
 
 
@@ -634,6 +664,18 @@ def generate_chunks(manifest: dict, output_dir: str, ref_path: str, lang: str,
         progress = done_before + i + 1
         log.info(f"[{progress}/{total}] Generating {cid}: {chunk['text'][:60]}...")
 
+        # Sanitize text: remove control chars and unsupported Unicode
+        text = chunk["text"]
+        text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text)  # control chars
+        text = text.replace('\u200b', '').replace('\u200c', '').replace('\u200d', '')  # zero-width
+        text = text.replace('\u00a0', ' ').replace('\u2029', ' ').replace('\u2028', ' ')  # special whitespace
+        text = text.strip()
+        if not text:
+            log.warning(f"  Skipping {cid}: empty after sanitization")
+            manifest["chunks"][cid]["status"] = "done"
+            save_manifest(output_dir, manifest, full_manifest=full_manifest)
+            continue
+
         try:
             # Use aligned reference if available, otherwise use global ref
             chunk_ref = None
@@ -644,7 +686,7 @@ def generate_chunks(manifest: dict, output_dir: str, ref_path: str, lang: str,
 
             if chunk_ref:
                 wav = model.generate(
-                    text=chunk["text"],
+                    text=text,
                     language_id=lang,
                     audio_prompt_path=chunk_ref,
                     temperature=temperature,
@@ -654,7 +696,7 @@ def generate_chunks(manifest: dict, output_dir: str, ref_path: str, lang: str,
                 )
             else:
                 wav = model.generate(
-                    text=chunk["text"],
+                    text=text,
                     language_id=lang,
                     temperature=temperature,
                     cfg_weight=cfg_weight,
@@ -672,6 +714,13 @@ def generate_chunks(manifest: dict, output_dir: str, ref_path: str, lang: str,
         except Exception as e:
             manifest["chunks"][cid]["status"] = "failed"
             log.error(f"  FAILED: {e}")
+
+            # CUDA assert errors corrupt the GPU context — all subsequent ops will fail
+            if "device-side assert" in str(e) or "CUDA error" in str(e):
+                log.error("CUDA context is corrupted. Saving progress and exiting.")
+                log.error("Re-run with --resume --retry-failed to continue.")
+                save_manifest(output_dir, manifest, full_manifest=full_manifest)
+                sys.exit(1)
 
         # Save manifest after every chunk for resumability
         save_manifest(output_dir, manifest, full_manifest=full_manifest)
