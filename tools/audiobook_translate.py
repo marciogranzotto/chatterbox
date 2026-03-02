@@ -712,15 +712,19 @@ def generate_chunks(manifest: dict, output_dir: str, ref_path: str, lang: str,
             log.info(f"  Saved: {wav_path}")
 
         except Exception as e:
-            manifest["chunks"][cid]["status"] = "failed"
-            log.error(f"  FAILED: {e}")
+            err_str = str(e)
 
             # CUDA assert errors corrupt the GPU context — all subsequent ops will fail
-            if "device-side assert" in str(e) or "CUDA error" in str(e):
+            if "device-side assert" in err_str or "CUDA error" in err_str:
+                manifest["chunks"][cid]["status"] = "pending"  # auto-retry next run
+                log.error(f"  CUDA error on {cid}: {e}")
                 log.error("CUDA context is corrupted. Saving progress and exiting.")
-                log.error("Re-run with --resume --retry-failed to continue.")
+                log.error("Re-run with --resume to continue (failed chunk will be retried).")
                 save_manifest(output_dir, manifest, full_manifest=full_manifest)
                 sys.exit(1)
+
+            manifest["chunks"][cid]["status"] = "failed"
+            log.error(f"  FAILED: {e}")
 
         # Save manifest after every chunk for resumability
         save_manifest(output_dir, manifest, full_manifest=full_manifest)
