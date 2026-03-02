@@ -177,7 +177,7 @@ def transcribe_audio(audio_path: str, output_dir: str, model_size: str = "base")
 
     if os.path.exists(transcript_path):
         log.info(f"Loading cached Whisper transcript: {transcript_path}")
-        with open(transcript_path) as f:
+        with open(transcript_path, encoding="utf-8") as f:
             return json.load(f)
 
     # Convert to wav first for reliability (Whisper's ffmpeg handling can be fragile with m4b)
@@ -208,7 +208,7 @@ def transcribe_audio(audio_path: str, output_dir: str, model_size: str = "base")
     segments = []
     completed_chunks = 0
     if os.path.exists(partial_path):
-        with open(partial_path) as f:
+        with open(partial_path, encoding="utf-8") as f:
             partial = json.load(f)
         segments = partial["segments"]
         completed_chunks = partial["completed_chunks"]
@@ -257,7 +257,7 @@ def transcribe_audio(audio_path: str, output_dir: str, model_size: str = "base")
 
         # Save checkpoint after each chunk
         completed_chunks = i + 1
-        with open(partial_path, "w") as f:
+        with open(partial_path, "w", encoding="utf-8") as f:
             json.dump({
                 "completed_chunks": completed_chunks,
                 "total_chunks": num_chunks,
@@ -273,8 +273,8 @@ def transcribe_audio(audio_path: str, output_dir: str, model_size: str = "base")
         os.remove(chunk_wav)
 
     # Save final transcript
-    with open(transcript_path, "w") as f:
-        json.dump(segments, f, indent=2)
+    with open(transcript_path, "w", encoding="utf-8") as f:
+        json.dump(segments, f, indent=2, ensure_ascii=False)
 
     # Clean up partial checkpoint
     if os.path.exists(partial_path):
@@ -566,7 +566,7 @@ def load_manifest(output_dir: str) -> dict | None:
     """Load an existing manifest if it exists."""
     manifest_path = os.path.join(output_dir, "manifest.json")
     if os.path.exists(manifest_path):
-        with open(manifest_path) as f:
+        with open(manifest_path, encoding="utf-8") as f:
             return json.load(f)
     return None
 
@@ -581,7 +581,7 @@ def save_manifest(output_dir: str, manifest: dict, full_manifest: dict = None):
         to_save = full_manifest
     else:
         to_save = manifest
-    with open(manifest_path, "w") as f:
+    with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(to_save, f, indent=2, ensure_ascii=False)
 
 
@@ -906,7 +906,7 @@ def main():
 
         # Save chapter ranges for debugging
         ranges_path = os.path.join(args.output, "chapter_ranges.json")
-        with open(ranges_path, "w") as f:
+        with open(ranges_path, "w", encoding="utf-8") as f:
             json.dump(chapter_ranges, f, indent=2, ensure_ascii=False)
         log.info(f"Chapter ranges saved: {ranges_path}")
 
