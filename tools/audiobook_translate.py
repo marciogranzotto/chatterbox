@@ -494,20 +494,29 @@ def load_manifest(output_dir: str) -> dict | None:
     return None
 
 
-def save_manifest(output_dir: str, manifest: dict):
-    """Save manifest to disk."""
+def save_manifest(output_dir: str, manifest: dict, full_manifest: dict = None):
+    """Save manifest to disk. If full_manifest is provided, merge filtered
+    chunks back into the full manifest before saving (preserves chunks
+    outside the current chapter selection)."""
     manifest_path = os.path.join(output_dir, "manifest.json")
+    if full_manifest is not None:
+        full_manifest["chunks"].update(manifest["chunks"])
+        to_save = full_manifest
+    else:
+        to_save = manifest
     with open(manifest_path, "w") as f:
-        json.dump(manifest, f, indent=2, ensure_ascii=False)
+        json.dump(to_save, f, indent=2, ensure_ascii=False)
 
 
 def generate_chunks(manifest: dict, output_dir: str, ref_path: str, lang: str,
                     max_chunks: int | None = None, repetition_penalty: float = 2.5,
                     exaggeration: float = 0.7, cfg_weight: float = 0.5,
-                    temperature: float = 0.8, aligned_refs: dict[str, str] | None = None):
+                    temperature: float = 0.8, aligned_refs: dict[str, str] | None = None,
+                    full_manifest: dict = None):
     """Generate TTS audio for all pending chunks.
 
     If aligned_refs is provided, uses per-chunk reference clips instead of a single global reference.
+    If full_manifest is provided, merges updates back when saving (for chapter-filtered resumes).
     """
     from chatterbox.mtl_tts import ChatterboxMultilingualTTS
 
@@ -588,7 +597,7 @@ def generate_chunks(manifest: dict, output_dir: str, ref_path: str, lang: str,
             log.error(f"  FAILED: {e}")
 
         # Save manifest after every chunk for resumability
-        save_manifest(output_dir, manifest)
+        save_manifest(output_dir, manifest, full_manifest=full_manifest)
 
     done_total = sum(1 for c in manifest["chunks"].values() if c["status"] == "done")
     failed = sum(1 for c in manifest["chunks"].values() if c["status"] == "failed")
@@ -772,9 +781,24 @@ def main():
     # Stage 1c: Build chunk list and manifest
     all_chunks = build_chunk_list(chapters)
 
+    # Determine which chapter indices are selected
+    selected_chapter_idxs = {c["chapter_idx"] for c in all_chunks}
+    full_manifest = None  # Track full manifest when filtering on resume
+
     if args.resume:
         manifest = load_manifest(args.output)
         if manifest:
+            # Filter manifest to only selected chapters
+            if selected_chapter_idxs != {c["chapter_idx"] for c in manifest["chunks"].values()}:
+                full_manifest = manifest
+                filtered_chunks = {
+                    cid: chunk for cid, chunk in manifest["chunks"].items()
+                    if chunk["chapter_idx"] in selected_chapter_idxs
+                }
+                skipped = len(manifest["chunks"]) - len(filtered_chunks)
+                manifest = {**manifest, "chunks": filtered_chunks}
+                if skipped:
+                    log.info(f"Filtered to selected chapters: skipped {skipped} chunks outside range")
             done = sum(1 for c in manifest["chunks"].values() if c["status"] == "done")
             total = len(manifest["chunks"])
             log.info(f"Resuming: {done}/{total} chunks already done")
@@ -793,7 +817,7 @@ def main():
         if reset_count:
             log.info(f"Reset {reset_count} failed chunks to pending for retry")
 
-    save_manifest(args.output, manifest)
+    save_manifest(args.output, manifest, full_manifest=full_manifest)
     log.info(f"Manifest saved with {len(manifest['chunks'])} chunks")
 
     # Stage 1d: Segment alignment (optional)
@@ -817,7 +841,8 @@ def main():
         # Stage 2: Generate TTS audio
         generate_chunks(manifest, args.output, ref_path, args.lang, args.max_chunks,
                         args.repetition_penalty, args.exaggeration, args.cfg_weight,
-                        args.temperature, aligned_refs=aligned_refs)
+                        args.temperature, aligned_refs=aligned_refs,
+                        full_manifest=full_manifest)
 
         # Stage 3: Assemble audiobook
         assemble_audiobook(manifest, args.output, args.chunk_silence, args.paragraph_silence, args.chapter_silence, lang=args.lang)
