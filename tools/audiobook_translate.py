@@ -14,6 +14,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -735,6 +736,7 @@ def main():
         log.error("--ref-start and --ref-end must both be provided, or both omitted")
         sys.exit(1)
 
+    start_time = time.time()
     log.info("Audiobook translation pipeline starting")
     log.info(f"  Audio: {args.audio}")
     log.info(f"  Ebook: {args.ebook}")
@@ -825,7 +827,10 @@ def main():
         if aligned_refs:
             log.info(f"Would use {len(aligned_refs)} aligned reference clips")
 
-    log.info("Pipeline complete!")
+    elapsed = time.time() - start_time
+    hours, remainder = divmod(int(elapsed), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    log.info(f"Pipeline complete! Total time: {hours}h {minutes}m {seconds}s")
 
 
 if __name__ == "__main__":

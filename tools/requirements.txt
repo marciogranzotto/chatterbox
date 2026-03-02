@@ -1,0 +1,6 @@
+torch
+torchaudio
+EbookLib
+beautifulsoup4
+lxml
+openai-whisper
