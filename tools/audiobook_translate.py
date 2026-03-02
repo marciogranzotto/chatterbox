@@ -10,6 +10,7 @@ Translates an English audiobook into another language by:
 import argparse
 import json
 import logging
+import math
 import os
 import re
 import subprocess
@@ -149,13 +150,30 @@ def parse_epub(epub_path: str) -> list[dict]:
     return chapters
 
 
+def get_audio_duration(audio_path: str) -> float:
+    """Get audio duration in seconds using ffprobe."""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        audio_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        log.error(f"ffprobe failed: {result.stderr}")
+        sys.exit(1)
+    return float(result.stdout.strip())
+
+
 def transcribe_audio(audio_path: str, output_dir: str, model_size: str = "base") -> list[dict]:
     """Transcribe the English audiobook with Whisper to get timestamped segments.
 
     Returns list of segments: [{"start": float, "end": float, "text": str}]
     Caches the transcript as JSON to avoid re-transcription.
+    Transcribes in 30-minute chunks with checkpointing for resumability.
     """
     transcript_path = os.path.join(output_dir, "whisper_transcript.json")
+    partial_path = os.path.join(output_dir, "whisper_transcript_partial.json")
 
     if os.path.exists(transcript_path):
         log.info(f"Loading cached Whisper transcript: {transcript_path}")
@@ -180,31 +198,90 @@ def transcribe_audio(audio_path: str, output_dir: str, model_size: str = "base")
             sys.exit(1)
         log.info(f"Converted to: {wav_path}")
 
+    # Get total duration and split into chunks
+    total_duration = get_audio_duration(wav_path)
+    CHUNK_MINUTES = 30
+    chunk_duration = CHUNK_MINUTES * 60
+    num_chunks = math.ceil(total_duration / chunk_duration)
+
+    # Load partial progress if available
+    segments = []
+    completed_chunks = 0
+    if os.path.exists(partial_path):
+        with open(partial_path) as f:
+            partial = json.load(f)
+        segments = partial["segments"]
+        completed_chunks = partial["completed_chunks"]
+        log.info(f"Resuming transcription from chunk {completed_chunks + 1}/{num_chunks} "
+                 f"({completed_chunks * CHUNK_MINUTES}min already transcribed)")
+
     import whisper
-    if torch.cuda.is_available():
-        whisper_device = "cuda"
-    else:
-        whisper_device = "cpu"
+    whisper_device = "cuda" if torch.cuda.is_available() else "cpu"
     log.info(f"Transcribing with Whisper ({model_size}) on {whisper_device}...")
-    log.info("  (This handles long files natively via 30s sliding windows)")
+    log.info(f"  Total duration: {total_duration/3600:.1f}h in {num_chunks} chunks of {CHUNK_MINUTES}min")
     w_model = whisper.load_model(model_size, device=whisper_device)
-    result = w_model.transcribe(wav_path, language="en", verbose=True, fp16=(whisper_device == "cuda"))
+
+    chunk_wav = os.path.join(output_dir, "whisper_chunk_temp.wav")
+
+    for i in range(completed_chunks, num_chunks):
+        start_time = i * chunk_duration
+        remaining = min(chunk_duration, total_duration - start_time)
+        log.info(f"Transcribing chunk {i + 1}/{num_chunks} "
+                 f"({start_time/3600:.1f}h - {(start_time + remaining)/3600:.1f}h)...")
+
+        # Extract chunk with ffmpeg
+        cmd = [
+            "ffmpeg", "-y",
+            "-ss", str(start_time),
+            "-t", str(remaining),
+            "-i", wav_path,
+            "-ac", "1", "-ar", "16000", "-acodec", "pcm_s16le",
+            chunk_wav,
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            log.error(f"ffmpeg chunk extraction failed: {result.stderr}")
+            sys.exit(1)
+
+        # Transcribe chunk
+        result = w_model.transcribe(chunk_wav, language="en", verbose=True,
+                                    fp16=(whisper_device == "cuda"))
+
+        # Add segments with time offset
+        for seg in result["segments"]:
+            segments.append({
+                "start": seg["start"] + start_time,
+                "end": seg["end"] + start_time,
+                "text": seg["text"].strip(),
+            })
+
+        # Save checkpoint after each chunk
+        completed_chunks = i + 1
+        with open(partial_path, "w") as f:
+            json.dump({
+                "completed_chunks": completed_chunks,
+                "total_chunks": num_chunks,
+                "chunk_duration_min": CHUNK_MINUTES,
+                "segments": segments,
+            }, f, indent=2)
+        log.info(f"  Checkpoint saved: {completed_chunks}/{num_chunks} chunks done")
+
     del w_model
 
-    segments = []
-    for seg in result["segments"]:
-        segments.append({
-            "start": seg["start"],
-            "end": seg["end"],
-            "text": seg["text"].strip(),
-        })
+    # Clean up temp chunk
+    if os.path.exists(chunk_wav):
+        os.remove(chunk_wav)
 
-    # Cache transcript
+    # Save final transcript
     with open(transcript_path, "w") as f:
         json.dump(segments, f, indent=2)
 
-    total_duration = segments[-1]["end"] if segments else 0
-    log.info(f"Transcription complete: {len(segments)} segments, {total_duration/3600:.1f} hours")
+    # Clean up partial checkpoint
+    if os.path.exists(partial_path):
+        os.remove(partial_path)
+
+    total_transcribed = segments[-1]["end"] if segments else 0
+    log.info(f"Transcription complete: {len(segments)} segments, {total_transcribed/3600:.1f} hours")
 
     # Clean up intermediate WAV (large file)
     if os.path.exists(wav_path):
